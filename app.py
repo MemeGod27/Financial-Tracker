@@ -19,7 +19,7 @@ from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="Market Sentiment Tracker", layout="wide")
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 
 # ------------------------------------------------------------------ API key
