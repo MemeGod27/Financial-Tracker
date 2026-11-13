@@ -512,7 +512,11 @@ def gemini_classify(
         return {}
 
     started = time.perf_counter()
-    batch = cached_gemini_classification(api_key, selected_headlines, model_name)
+    try:
+        batch = cached_gemini_classification(api_key, selected_headlines, model_name)
+    except Exception:
+        _LOGGER.warning("Gemini sentiment classification unavailable; using fallback.")
+        batch = {}
     log_timing("gemini_sentiment_classification", started)
 
     mapped: dict[int, dict[str, Any]] = {}
@@ -762,7 +766,6 @@ if not ticker_symbol:
     st.warning("Enter a ticker symbol to continue.")
     st.stop()
 
-# End-user ticker variable for the rest of the app.
 ticker = ticker_symbol
 
 try:
@@ -1134,9 +1137,8 @@ with tab_brief:
                 log_timing("analyst_briefing_generation_total", started)
 
         if state_key in st.session_state:
-            st.markdown('<div class="brief">', unsafe_allow_html=True)
-            st.markdown(st.session_state[state_key])
-            st.markdown("</div>", unsafe_allow_html=True)
+            with st.container(border=True):
+                st.markdown(st.session_state[state_key])
             with st.expander("See the ranked headlines used"):
                 for i, row in enumerate(top.itertuples(), 1):
                     st.write(
