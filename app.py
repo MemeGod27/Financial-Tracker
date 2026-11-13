@@ -8,6 +8,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -306,15 +307,45 @@ def extract_news_item(item: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def safe_external_url(value: Any) -> str:
+    """Accept only well-formed HTTPS URLs suitable for external links."""
+    if not isinstance(value, str):
+        return ""
+    url = value.strip()
+    if not url or any(ord(char) < 32 or char.isspace() for char in url):
+        return ""
+    try:
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme.casefold() != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return ""
+        parsed.port
+    except ValueError:
+        return ""
+    return url
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_market_data(ticker: str, period: str) -> tuple[pd.DataFrame, list[dict[str, Any]], str]:
-    """Fetch price history and normalized news from Yahoo Finance once per ticker+period."""
+    """Fetch price history and reuse cached ticker metadata and news."""
     started = time.perf_counter()
     instrument = yf.Ticker(ticker)
     prices = instrument.history(period=period, auto_adjust=False)
     log_timing("yahoo_price_retrieval", started)
 
+    currency, news = fetch_company_metadata(ticker)
+    return prices, news, currency
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_company_metadata(ticker: str) -> tuple[str, list[dict[str, Any]]]:
+    """Cache currency and news independently of the selected price-history period."""
     started = time.perf_counter()
+    instrument = yf.Ticker(ticker)
     try:
         currency = instrument.fast_info.get("currency") or "USD"
     except Exception:
@@ -325,16 +356,15 @@ def fetch_market_data(ticker: str, period: str) -> tuple[pd.DataFrame, list[dict
     except Exception:
         raw_news = []
 
-    news: list[dict[str, Any]] = []
-    for item in raw_news:
-        if not isinstance(item, dict):
-            continue
-        normalized = extract_news_item(item)
-        if normalized:
-            news.append(normalized)
+    news = [
+        normalized
+        for item in raw_news
+        if isinstance(item, dict)
+        for normalized in [extract_news_item(item)]
+        if normalized
+    ]
     log_timing("yahoo_news_retrieval_and_normalization", started)
-
-    return prices, news, currency
+    return currency, news
 
 
 @st.cache_resource(show_spinner=False)
@@ -349,6 +379,7 @@ def resolve_company(query: str) -> tuple[str, str, str] | None:
     return COMPANIES.get(query.casefold())
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def keyword_classification(headline: str) -> dict[str, Any]:
     """Fallback classification for headlines when Gemini is unavailable."""
     text = headline.lower()
@@ -439,11 +470,22 @@ def cached_gemini_classification(api_key: str, headline_batch: tuple[str, ...], 
                 contents=prompt,
             )
             parsed = parse_json_response(response.text or "")
-            records = parsed if isinstance(parsed, list) else parsed.get("items", [])
+            records = (
+                parsed
+                if isinstance(parsed, list)
+                else parsed.get("items", [])
+                if isinstance(parsed, dict)
+                else []
+            )
             result: dict[int, dict[str, Any]] = {}
             for record in records:
                 if isinstance(record, dict) and "id" in record:
-                    result[int(record["id"])] = normalize_classification(record)
+                    try:
+                        record_id = int(record["id"])
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= record_id < len(headline_batch):
+                        result[record_id] = normalize_classification(record)
             return result
         except Exception:
             if attempt < 2:
@@ -456,15 +498,15 @@ def gemini_classify(
     headlines: list[dict[str, Any]],
     model_name: str = "gemini-2.0-flash",
 ) -> dict[int, dict[str, Any]]:
-    """Classify only the highest-value headlines when there are many to keep the cost and latency low."""
+    """Classify only the newest 15 headlines when there are many to keep the cost and latency low."""
     if not api_key or not headlines:
         return {}
 
     selected_indices = sorted(
         range(len(headlines)),
-        key=lambda idx: relevance_score(headlines[idx]["headline"]),
+        key=lambda idx: headlines[idx]["published"],
         reverse=True,
-    )[:20]
+    )[:15]
     selected_headlines = tuple(headlines[i]["headline"] for i in selected_indices)
     if not selected_headlines:
         return {}
@@ -539,6 +581,19 @@ def prepare_daily_sentiment(df: pd.DataFrame) -> pd.DataFrame:
     return df.groupby("date", as_index=False)["score"].mean().sort_values("date")
 
 
+@st.cache_data(show_spinner=False)
+def summarize_catalysts(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute catalyst counts and mean scores once for KPIs and charts."""
+    columns = ["catalyst", "Headlines", "MeanSentiment"]
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    return (
+        df.groupby("catalyst", as_index=False)
+        .agg(Headlines=("headline", "count"), MeanSentiment=("score", "mean"))
+        .sort_values("Headlines", ascending=True)
+    )
+
+
 def weighted_average_sentiment(df: pd.DataFrame) -> float | None:
     """Calculate recency-weighted average sentiment."""
     if df.empty:
@@ -567,20 +622,18 @@ def calculate_confidence(df: pd.DataFrame) -> int:
     return int(round(max(0, min(100, confidence))))
 
 
-def top_catalyst(df: pd.DataFrame) -> str:
-    if df.empty or df["catalyst"].dropna().empty:
+def top_catalyst(stats: pd.DataFrame) -> str:
+    if stats.empty:
         return "—"
-    return str(df["catalyst"].value_counts().index[0])
+    return str(stats.loc[stats["Headlines"].idxmax(), "catalyst"])
 
 
-def catalyst_extreme(df: pd.DataFrame, bullish: bool) -> str:
+def catalyst_extreme(stats: pd.DataFrame, bullish: bool) -> str:
     """Return the catalyst with the highest/lowest mean sentiment."""
-    if df.empty:
+    if stats.empty:
         return "—"
-    means = df.groupby("catalyst")["score"].mean()
-    if means.empty:
-        return "—"
-    return str(means.idxmax() if bullish else means.idxmin())
+    index = stats["MeanSentiment"].idxmax() if bullish else stats["MeanSentiment"].idxmin()
+    return str(stats.loc[index, "catalyst"])
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -698,9 +751,12 @@ with st.sidebar:
 
     if st.button("Clear cached analysis", use_container_width=True):
         fetch_market_data.clear()
+        fetch_company_metadata.clear()
         cached_gemini_classification.clear()
+        keyword_classification.clear()
         prepare_daily_sentiment.clear()
         add_ranking.clear()
+        summarize_catalysts.clear()
 
 if not ticker_symbol:
     st.warning("Enter a ticker symbol to continue.")
@@ -723,6 +779,7 @@ news = [item for item in all_news if item["published"] >= cutoff]
 scored, method = score_headlines(news, api_key)
 ranked = add_ranking(scored) if not scored.empty else scored.copy()
 daily = prepare_daily_sentiment(scored)
+catalyst_stats = summarize_catalysts(scored)
 
 if prices is not None and not prices.empty and "Close" in prices.columns:
     close_prices = prices["Close"].dropna()
@@ -755,7 +812,7 @@ k3.metric("Avg. sentiment", f"{avg:+.2f}" if avg is not None else "—")
 k4.metric("Confidence", f"{confidence}%")
 k5.metric("Headlines analysed", f"{len(scored)}")
 
-summary_catalyst = top_catalyst(scored)
+summary_catalyst = top_catalyst(catalyst_stats)
 st.markdown(
     f"""
     <div class="summary-card">
@@ -934,10 +991,10 @@ with tab_news:
 
         for row in view.itertuples():
             title = html.escape(str(row.headline))
-            safe_url = html.escape(str(row.url), quote=True)
+            safe_url = safe_external_url(row.url)
             link = (
-                f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer">{title}</a>'
-                if isinstance(row.url, str) and row.url.startswith("https://")
+                f'<a href="{html.escape(safe_url, quote=True)}" target="_blank" rel="noopener noreferrer">{title}</a>'
+                if safe_url
                 else f"<b>{title}</b>"
             )
             st.markdown(
@@ -979,18 +1036,12 @@ with tab_catalysts:
         catalyst_kpis = st.columns(4)
         catalyst_kpis[0].metric("High impact headlines", high_impact_count)
         catalyst_kpis[1].metric("Top catalyst", summary_catalyst)
-        catalyst_kpis[2].metric("Most bullish catalyst", catalyst_extreme(scored, True))
-        catalyst_kpis[3].metric("Most bearish catalyst", catalyst_extreme(scored, False))
+        catalyst_kpis[2].metric("Most bullish catalyst", catalyst_extreme(catalyst_stats, True))
+        catalyst_kpis[3].metric("Most bearish catalyst", catalyst_extreme(catalyst_stats, False))
 
         left, right = st.columns(2)
         with left:
             st.markdown("**Headline volume by catalyst**")
-            catalyst_stats = (
-                scored.groupby("catalyst")
-                .agg(Headlines=("headline", "count"), MeanSentiment=("score", "mean"))
-                .reset_index()
-                .sort_values("Headlines", ascending=True)
-            )
             catalyst_chart = go.Figure(
                 go.Bar(
                     x=catalyst_stats["Headlines"],
@@ -1036,8 +1087,7 @@ with tab_catalysts:
             st.plotly_chart(impact_chart, use_container_width=True)
 
         st.markdown("**Highest-ranked headlines**")
-        ranked_display = ranked.head(10).copy()
-        display = ranked_display[
+        display = ranked.head(10)[
             [
                 "published", "headline", "sentiment", "score",
                 "catalyst", "impact", "rank_score", "source",
